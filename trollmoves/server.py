@@ -43,7 +43,7 @@ from six.moves.queue import Empty, Queue
 from six.moves.urllib.parse import urlparse, urlunparse
 from six import string_types
 from collections import deque
-from threading import Thread, Event, current_thread, Lock
+from threading import Thread, Event, current_thread, Lock, RLock
 
 import pyinotify
 from zmq import NOBLOCK, POLLIN, PULL, PUSH, ROUTER, Poller, ZMQError
@@ -686,22 +686,20 @@ class Mover(object):
         self.attrs = attrs or {}
 
     def copy(self):
-        """Copy it !
-        """
-
+        """Copy it."""
         raise NotImplementedError("Copy for scheme " + self.destination.scheme
                                   + " not implemented (yet).")
 
     def move(self):
-        """Move it !
-        """
-
+        """Move it."""
         raise NotImplementedError("Move for scheme " + self.destination.scheme
                                   + " not implemented (yet).")
 
     def get_connection(self, hostname, port, username=None):
+        """Get an active connection."""
         with self.active_connection_lock:
-            LOGGER.debug('Getting connection to %s@%s:%s', self.destination.username, self.destination.hostname, self.destination.port)
+            LOGGER.debug('Getting connection to %s@%s:%s', self.destination.username,
+                         self.destination.hostname, self.destination.port)
             try:
                 connection, timer = self.active_connections[(hostname, port, username)]
                 if not self.is_connected(connection):
@@ -712,7 +710,7 @@ class Mover(object):
             except KeyError:
                 connection = self.open_connection()
 
-            timer = CTimer(int(self.attrs.get('connection_uptime', 30)),
+            timer = CTimer(int(self.attrs.get('connection_uptime', 30.0)),
                            self.delete_connection, (connection,))
             timer.start()
             self.active_connections[(hostname, port, username)] = connection, timer
@@ -720,8 +718,10 @@ class Mover(object):
             return connection
 
     def delete_connection(self, connection):
+        """Delete a connection."""
         with self.active_connection_lock:
-            LOGGER.debug('Closing connection to %s@%s:%s', self.destination.username, self.destination.hostname, self.destination.port)
+            LOGGER.debug('Closing connection to %s@%s:%s', self.destination.username,
+                         self.destination.hostname, self.destination.port)
             try:
                 if current_thread().finished.is_set():
                     return
@@ -785,13 +785,13 @@ class CTimer(Thread):
 
 
 class FtpMover(Mover):
-    """Move files over ftp.
-    """
+    """Move files over ftp."""
 
     active_connections = dict()
-    active_connection_lock = Lock()
+    active_connection_lock = RLock()
 
     def open_connection(self):
+        """Open the FTP session."""
         connection = FTP(timeout=10)
         connection.connect(self.destination.hostname, self.destination.port or
                            21)
@@ -805,6 +805,7 @@ class FtpMover(Mover):
 
     @staticmethod
     def is_connected(connection):
+        """Check if FTP is up."""
         try:
             connection.voidcmd("NOOP")
             return True
@@ -813,40 +814,40 @@ class FtpMover(Mover):
         except IOError:
             return False
 
-
     @staticmethod
     def close_connection(connection):
+        """Close the FTP connection."""
         try:
             connection.quit()
         except all_errors:
             connection.close()
 
+    def cd_tree(self, current_dir, connection):
+        """Advanced cd."""
+        if current_dir != "":
+            try:
+                connection.cwd(current_dir)
+            except (IOError, error_perm):
+                self.cd_tree("/".join(current_dir.split("/")[:-1]))
+                connection.mkd(current_dir)
+                connection.cwd(current_dir)
 
     def move(self):
-        """Push it !
-        """
+        """Push and erase."""
         self.copy()
         os.remove(self.origin)
 
     def copy(self):
-        """Push it !
-        """
-        connection = self.get_connection(self.destination.hostname, self.destination.port, self.destination.username)
+        """Push the file."""
+        with self.active_connection_lock:
+            connection = self.get_connection(self.destination.hostname, self.destination.port, self.destination.username)
 
-        def cd_tree(current_dir):
-            if current_dir != "":
-                try:
-                    connection.cwd(current_dir)
-                except (IOError, error_perm):
-                    cd_tree("/".join(current_dir.split("/")[:-1]))
-                    connection.mkd(current_dir)
-                    connection.cwd(current_dir)
-
-        LOGGER.debug('cd to %s', os.path.dirname(self.destination.path))
-        cd_tree(os.path.dirname(self.destination.path))
-        with open(self.origin, 'rb') as file_obj:
-            connection.storbinary('STOR ' + os.path.basename(self.origin),
-                                  file_obj)
+            if connection.pwd() != self.destination.path:
+                LOGGER.debug('cd to %s', os.path.dirname(self.destination.path))
+                self.cd_tree(os.path.dirname(self.destination.path))
+            with open(self.origin, 'rb') as file_obj:
+                connection.storbinary('STOR ' + os.path.basename(self.origin),
+                                      file_obj)
 
 
 class ScpMover(Mover):
